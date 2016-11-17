@@ -35,6 +35,7 @@ import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Concurrent.MVar (MVar, modifyMVarMasked_, newMVar, takeMVar)
 import Control.Exception (Exception, throwIO, bracket, finally, mask_)
 import Control.Monad (when)
+import Control.Monad.Cont (cont, runCont)
 import Data.Bits (Bits, toIntegralSized)
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe)
@@ -45,6 +46,7 @@ import Foreign.C.String (CString)
 import Foreign.ForeignPtr (newForeignPtr, withForeignPtr)
 import Foreign.Marshal.Alloc (free)
 import Foreign.Marshal.Array (withArrayLen, peekArray, mallocArray, copyArray)
+import Foreign.StablePtr (newStablePtr, freeStablePtr, castPtrToStablePtr, castStablePtrToPtr)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.ByteString as B
 import qualified Data.Text as T
@@ -125,7 +127,7 @@ run session feeds fetches targets = do
     mask_ $
         -- Feeds
         withStringArrayLen (fst <$> feeds) $ \feedsLen feedNames ->
-        mapM (createRawTensor . snd) feeds >>= \feedTensors ->
+        nest (map (withRawTensor . snd) feeds) $ \feedTensors ->
         withArrayLen feedTensors $ \_ cFeedTensors ->
         -- Fetches.
         withStringArrayLen fetches $ \fetchesLen fetchNames ->
@@ -141,7 +143,6 @@ run session feeds fetches targets = do
                 fetchNames tensorOuts (safeConvert fetchesLen)
                 ctargets (safeConvert targetsLen)
                 nullPtr
-            mapM_ Raw.deleteTensor feedTensors
             outTensors <- peekArray fetchesLen tensorOuts
             mapM createTensorData outTensors
 
@@ -159,36 +160,39 @@ safeConvert x =
             show (fromIntegral x :: b)))
     (toIntegralSized x)
 
-
--- | Use a list of ByteString as a list of CString.
-withStringList :: [B.ByteString] -> ([CString] -> IO a) -> IO a
-withStringList strings fn = go strings []
-  where
-    go [] cs = fn (reverse cs)
-    -- TODO(fmayle): Is it worth using unsafeAsCString here?
-    go (x:xs) cs = B.useAsCString x $ \c -> go xs (c:cs)
-
+-- Taken from https://wiki.haskell.org/Bracket_pattern.
+nest :: [(r -> a) -> a] -> ([r] -> a) -> a
+nest xs = runCont (mapM cont xs)
 
 -- | Use a list of ByteString as an array of CString.
 withStringArrayLen :: [B.ByteString] -> (Int -> Ptr CString -> IO a) -> IO a
-withStringArrayLen xs fn = withStringList xs (`withArrayLen` fn)
-
+withStringArrayLen xs fn = nest (map B.useAsCString xs) (`withArrayLen` fn)
 
 -- | Create a Raw.Tensor from a TensorData.
-createRawTensor :: TensorData -> IO Raw.Tensor
-createRawTensor (TensorData dims dt byteVec) =
-    withArrayLen (map safeConvert dims) $ \cdimsLen cdims -> do
-        let len = S.length byteVec
-        dest <- mallocArray len
-        S.unsafeWith byteVec $ \x -> copyArray dest x len
-        Raw.newTensor (toEnum $ fromEnum dt)
-                      cdims (safeConvert cdimsLen)
-                      (castPtr dest) (safeConvert len)
-                      tensorDeallocFunPtr nullPtr
+withRawTensor :: TensorData -> (Raw.Tensor -> IO a) -> IO a
+withRawTensor (TensorData dims dt byteVec) f =
+    S.unsafeWith byteVec (\bytes -> bracket (create bytes) Raw.deleteTensor f)
+  where
+    create bytes = do
+        -- Create a Raw.Tensor that points directly at the TensorData's
+        -- S.Vector's memory.
+        -- Note: We know that Raw.deleteTensor will be called before the
+        -- S.Vector is GC'd, but Raw.deleteTensor is more of a ref count
+        -- decrement than a delete, so we pass a StablePtr along as the
+        -- "deallocator_arg" to ensure that the S.Vector outlives the
+        -- Raw.Tensor.
+        byteVecRef <- newStablePtr byteVec
+        withArrayLen (map safeConvert dims) $ \cdimsLen cdims ->
+            Raw.newTensor (toEnum (fromEnum dt))
+                          cdims (safeConvert cdimsLen)
+                          (castPtr bytes) (safeConvert (S.length byteVec))
+                          tensorDeallocFunPtr (castStablePtrToPtr byteVecRef)
 
 {-# NOINLINE tensorDeallocFunPtr #-}
 tensorDeallocFunPtr :: FunPtr Raw.TensorDeallocFn
-tensorDeallocFunPtr = unsafePerformIO $ Raw.wrapTensorDealloc $ \x _ _ -> free x
+tensorDeallocFunPtr =
+    unsafePerformIO
+    (Raw.wrapTensorDealloc (\_ _ x -> freeStablePtr (castPtrToStablePtr x)))
 
 -- | Create a TensorData from a Raw.Tensor.
 --
