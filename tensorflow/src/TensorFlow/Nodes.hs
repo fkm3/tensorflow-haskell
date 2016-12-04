@@ -74,6 +74,9 @@ instance (Nodes t1, Nodes t2) => Nodes (t1, t2) where
 instance (Nodes t1, Nodes t2, Nodes t3) => Nodes (t1, t2, t3) where
     getNodes (x, y, z) = nodesUnion [getNodes x, getNodes y, getNodes z]
 
+instance (Nodes t1, Nodes t2, Nodes t3, Nodes t4) => Nodes (t1, t2, t3, t4) where
+    getNodes (x, y, z, w) = nodesUnion [getNodes x, getNodes y, getNodes z, getNodes w]
+
 instance (Fetchable t1 a1, Fetchable t2 a2) => Fetchable (t1, t2) (a1, a2) where
     getFetch (x, y) = liftA2 (,) <$> getFetch x <*> getFetch y
 
@@ -81,6 +84,15 @@ instance (Fetchable t1 a1, Fetchable t2 a2, Fetchable t3 a3)
          => Fetchable (t1, t2, t3) (a1, a2, a3) where
     getFetch (x, y, z) =
         liftA3 (,,) <$> getFetch x <*> getFetch y <*> getFetch z
+
+instance (Fetchable t1 a1, Fetchable t2 a2, Fetchable t3 a3, Fetchable t4 a4)
+         => Fetchable (t1, t2, t3, t4) (a1, a2, a3, a4) where
+    getFetch (x, y, z, w) = do
+        x' <- getFetch x
+        y' <- getFetch y
+        z' <- getFetch z
+        w' <- getFetch w
+        return ((,,,) <$> x' <*> y' <*> z' <*> w')
 
 instance Nodes t => Nodes [t] where
     getNodes = nodesUnion . map getNodes

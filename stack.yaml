@@ -12,6 +12,9 @@ packages:
 - tensorflow-queue
 - tensorflow-nn
 - tensorflow-test
+- tensorflow-gym
+- location: ../gym-http-api/binding-haskell
+  extra-dep: true
 
 extra-deps:
 # proto-lens is not yet in Stackage.
@@ -27,3 +30,7 @@ explicit-setup-deps:
 # For Mac OS X, whose linker doesn't use this path by default:
 extra-lib-dirs:
     - /usr/local/lib
+
+docker:
+  enable: true
+  image: tensorflow/haskell:v0
