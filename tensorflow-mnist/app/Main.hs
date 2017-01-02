@@ -67,13 +67,15 @@ createModel = do
     -- Inputs.
     images <- TF.placeholder [batchSize, numPixels]
 
-    (params, _, nn) <- Layer.runLayer [batchSize, 1, 28, 28] $
-        Layer.conv2d 5 2 32 TF.relu
-        >>> Layer.conv2d 5 2 64 TF.relu
+    let conv2d = Layer.conv2d Layer.NCHW Layer.SAME
+    (params, _, nn) <- Layer.build [batchSize, numPixels] $
+        Layer.reshape [-1, 1, 28, 28]
+        >>> conv2d (5, 5) (2, 2) 32 TF.relu
+        >>> conv2d (5, 5) (2, 2) 64 TF.relu
         >>> Layer.flatten
         >>> Layer.dense 1024 TF.relu
         >>> Layer.dense numLabels id
-    logits <- TF.render (nn (TF.reshape images (TF.vector [-1 :: Int32, 1, 28, 28])))
+    logits <- nn images
 
     -- -- Hidden layer.
     -- let numUnits = 500

@@ -81,6 +81,8 @@ module TensorFlow.Core
     , group
       -- ** Misc
     , noOp
+    , addSummary
+    , collectAllSummaries
     ) where
 
 import TensorFlow.Build

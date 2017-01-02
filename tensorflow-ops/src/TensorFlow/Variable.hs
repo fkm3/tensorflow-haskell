@@ -27,21 +27,25 @@ module TensorFlow.Variable
     , assignAdd'
     , resourceApplyAdam
     , resourceApplyAdam'
+    , save
+    , restoreFromName
+    , restore
     ) where
 
+import Data.ByteString (ByteString)
 import qualified Data.Complex
 import qualified Data.Int
 import qualified Data.Word
 import Data.Text.Encoding (encodeUtf8)
 import Lens.Family2 ((.~), (&))
 import TensorFlow.Core
-import TensorFlow.Build (opDef)
-import TensorFlow.BuildOp (buildInputs, pureOp, OpParams)
+import TensorFlow.Build (opDef, encodeOutput)
+import TensorFlow.BuildOp (buildInputs, buildOp, pureOp, OpParams)
 import TensorFlow.Output (opInputs, unNodeName)
 import TensorFlow.Tensor (Rendered(..), ToTensor(..), renderValue, tensorNodeName)
 import TensorFlow.Types (tensorType)
 import qualified TensorFlow.GenOps.Core as CoreOps
-import TensorFlow.Ops (zeros)
+import TensorFlow.Ops (scalar, zeros)
 
 data Variable a = Variable
     { variableHandle   :: Tensor Value ResourceHandle
@@ -192,3 +196,45 @@ resourceApplyAdam' ::
     -> m (ControlNode)
 resourceApplyAdam' params (Variable var _) (Variable m _) (Variable v _) =
     CoreOps.resourceApplyAdam' params var m v
+
+-- TODO: Support heterogeneous list of tensors.
+save :: forall m a. (MonadBuild m, TensorType a)
+     => ByteString    -- ^ File path.
+     -> [Variable a]  -- ^ Tensors to save.
+     -> m ControlNode
+save path xs = build $ do
+    let toByteStringTensor = scalar . encodeUtf8 . encodeOutput . renderedOutput
+    let names = fmap toByteStringTensor xs
+    let types = replicate (length xs) (tensorType (undefined :: a))
+    names' <- buildInputs $ CoreOps.pack names
+    xs' <- buildInputs (map readValue xs)
+    path' <- buildInputs $ scalar path
+    buildOp [] $ opDef "Save"
+                    & opAttr "T" .~ types
+                    & opInputs .~ (path' ++ names' ++ xs')
+
+-- | Restore a tensor's value from a checkpoint file.
+--
+-- This version allows restoring from a checkpoint file that uses a different
+-- tensor name than the variable.
+restoreFromName :: forall m a . (MonadBuild m, TensorType a)
+                => ByteString  -- ^ File path.
+                -> ByteString  -- ^ Tensor name override.
+                -> Variable a  -- ^ Tensor to restore.
+                -> m ControlNode
+restoreFromName path name x = build $ do
+    path' <- buildInputs $ scalar path
+    name' <- buildInputs $ scalar name
+    restoreOp <- buildOp [] $ opDef "Restore"
+                               & opAttr "dt" .~ tensorType (undefined :: a)
+                               & opInputs .~ (path' ++ name')
+    group =<< assign x (restoreOp :: Tensor Value a)
+
+-- | Restore a tensor's value from a checkpoint file.
+restore :: forall m a . (MonadBuild m, TensorType a)
+        => ByteString  -- ^ File path.
+        -> Variable a  -- ^ Tensor to restore.
+        -> m ControlNode
+restore path x = restoreFromName path name x
+  where
+    name = encodeUtf8 $ encodeOutput $ renderedOutput x
