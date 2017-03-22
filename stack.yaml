@@ -16,6 +16,7 @@ packages:
 extra-deps:
 - snappy-framing-0.1.1
 - snappy-0.2.0.2
+- random-extras-0.19
 
 # For Mac OS X, whose linker doesn't use this path by default
 # unless you run `xcode-select --install`.

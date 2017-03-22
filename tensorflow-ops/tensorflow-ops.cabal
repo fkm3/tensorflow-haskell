@@ -15,11 +15,13 @@ cabal-version:       >=1.22
 library
   hs-source-dirs:   src
   exposed-modules: TensorFlow.Gradient
-                 , TensorFlow.Ops
                  , TensorFlow.EmbeddingOps
                  , TensorFlow.Minimize
+                 , TensorFlow.Initializers
                  , TensorFlow.NN
+                 , TensorFlow.Ops
                  , TensorFlow.Queue
+                 , TensorFlow.RNN
                  , TensorFlow.Variable
   build-depends:  proto-lens == 0.2.*
                 , base >= 4.7 && < 5

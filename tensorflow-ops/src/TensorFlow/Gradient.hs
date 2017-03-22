@@ -652,11 +652,24 @@ opGrad "Select" _ [toT -> c, toT -> x, _] [dz] =
     ]
   where zeros = CoreOps.zerosLike x
 
+opGrad "Sigmoid" nodeDef _ [dz] =
+    [Just $ CoreOps.sigmoidGrad output dz]
+  where
+    output :: Tensor Build a
+    output = toT $ Output 0 (NodeName (nodeDef ^. name))
+
+opGrad "Tanh" nodeDef _ [dz] =
+    [Just $ CoreOps.tanhGrad output dz]
+  where
+    output :: Tensor Build a
+    output = toT $ Output 0 (NodeName (nodeDef ^. name))
+
 -- TODO(gnezdo): Unlike Python, no control dependency on dz.
 opGrad "Log" _ [toT -> x] [dz] = [ Just $ dz `CoreOps.mul` CoreOps.inv x ]
--- TODO(gnezdo): Reuse the output instead of doing another exp,
--- though, it is probably CSE'd away anyway.
-opGrad "Exp" _ [toT -> x] [dz] = [ Just $ dz `CoreOps.mul` CoreOps.exp x ]
+opGrad "Exp" nodeDef [toT -> x] [dz] = [ Just $ dz `CoreOps.mul` output ]
+  where
+    output :: Tensor Build a
+    output = toT $ Output 0 (NodeName (nodeDef ^. name))
 opGrad "SparseSegmentSum" _ [toT -> x, toT -> y, toT -> t] [dz] =
     [ Just $ CoreOps.unsortedSegmentSum
              (CoreOps.gather dz (t :: Tensor Build Int32))
@@ -665,6 +678,14 @@ opGrad "SparseSegmentSum" _ [toT -> x, toT -> y, toT -> t] [dz] =
     , Nothing
     ]
   where inputRows = flatSlice (shape (x :: Tensor Build a)) 0 1
+
+
+opGrad "Pack" nodeDef _ [dz] =
+    Just <$> CoreOps.unpack' (opAttr "axis" .~ (lookupAttr nodeDef "axis" :: Int64))
+                             (lookupAttr nodeDef "N") dz
+
+opGrad "Unpack" nodeDef _ dzs =
+    [Just $ CoreOps.pack' (opAttr "axis" .~ (lookupAttr nodeDef "axis" :: Int64)) dzs]
 
 opGrad "LabelClasses" _ _ _ = [Nothing, Nothing]
 opGrad "LabelWeights" _ _ _ = [Nothing]
@@ -721,6 +742,7 @@ numOutputs o =
         "Exp" -> 1
         "Gather" -> 1
         "LabelClasses" -> 1
+        "Fill" -> 1
         "LabelWeights" -> 1
         "Log" -> 1
         "MatMul" -> 1
@@ -750,7 +772,10 @@ numOutputs o =
         "VarHandleOp" -> 1
         "Variable" -> 1
         "ZerosLike" -> 1
-        "Fill" -> 1
+        "Pack" -> 1
+        "Unpack" -> fromIntegral (lookupAttr o "N" :: Int64)
+        "Tanh" -> 1
+        "Sigmoid" -> 1
         _ -> error $ "numOuputs not implemented for " ++ show (o ^. op)
 
 -- Divides `x / y` assuming `x, y >= 0`, treating `0 / 0 = 0`

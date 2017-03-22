@@ -119,6 +119,7 @@ module TensorFlow.Ops
     , scalar'
     , shape
     , shape'
+    , slice
     , CoreOps.sign
     , CoreOps.sign'
     , CoreOps.size
@@ -139,6 +140,8 @@ module TensorFlow.Ops
     , CoreOps.transpose'
     , truncatedNormal
     , truncatedNormal'
+    , CoreOps.unpack
+    , CoreOps.unpack'
     , CoreOps.variable
     , CoreOps.variable'
     , vector
@@ -371,6 +374,9 @@ expandDims = CoreOps.expandDims
 
 expandDims' :: TensorType t => OpParams -> Tensor v1 t -> Tensor v2 Int32 -> Tensor Build t
 expandDims' = CoreOps.expandDims'
+
+slice :: TensorType t => Tensor v1 t -> Tensor v2 Int32 -> Tensor v3 Int32 -> Tensor Build t
+slice = CoreOps.slice
 
 -- | Helper function for reduction ops (translation of math_ops.reduced_shape).
 reducedShape :: (OneOf '[ Int32, Int64 ] t1, OneOf '[ Int32, Int64 ] t2) =>

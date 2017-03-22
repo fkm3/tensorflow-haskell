@@ -54,6 +54,29 @@ executable Main
                , transformers
                , vector
 
+executable Seq
+  default-language: Haskell2010
+  main-is: Seq.hs
+  hs-source-dirs: app
+  build-depends: base
+               , bytestring
+               , filepath
+               , containers
+               , tensorflow == 0.1.*
+               , tensorflow-proto == 0.1.*
+               , tensorflow-core-ops == 0.1.*
+               , tensorflow-ops == 0.1.*
+               , lens-family
+               , ghc
+               , random-extras
+               , random-fu
+               , monad-loops
+               , proto-lens
+               , text
+               , transformers
+               , vector
+               , Glob
+
 Test-Suite ParseTest
   default-language: Haskell2010
   type: exitcode-stdio-1.0
