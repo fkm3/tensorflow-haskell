@@ -45,6 +45,7 @@ executable Main
                , lens-family
                , proto-lens
                , tensorflow
+               , tensorflow-logging
                , tensorflow-mnist
                , tensorflow-mnist-input-data
                , tensorflow-ops

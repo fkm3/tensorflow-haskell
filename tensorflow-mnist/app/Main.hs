@@ -1,61 +1,74 @@
--- Copyright 2016 TensorFlow authors.
---
--- Licensed under the Apache License, Version 2.0 (the "License");
--- you may not use this file except in compliance with the License.
--- You may obtain a copy of the License at
---
---     http://www.apache.org/licenses/LICENSE-2.0
---
--- Unless required by applicable law or agreed to in writing, software
--- distributed under the License is distributed on an "AS IS" BASIS,
--- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
--- See the License for the specific language governing permissions and
--- limitations under the License.
-
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedLists #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 import Control.Monad (zipWithM, when, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Int (Int32, Int64)
 import Data.List (genericLength)
+import Data.ProtoLens (decodeMessageOrDie)
+import Data.Word (Word8)
+import Proto.Tensorflow.Core.Framework.Summary (Summary)
 import qualified Data.Text.IO as T
 import qualified Data.Vector as V
 
 import qualified TensorFlow.Core as TF
 import qualified TensorFlow.Gradient as TF
+import qualified TensorFlow.Logging as TF
 import qualified TensorFlow.Ops as TF
 
 import TensorFlow.Examples.MNIST.InputData
 import TensorFlow.Examples.MNIST.Parse
 
 numPixels, numLabels :: Int64
-numPixels = 28*28 :: Int64
-numLabels = 10 :: Int64
+numPixels = 28*28
+numLabels = 10
 
 -- | Create tensor with random values where the stddev depends on the width.
-randomParam :: Int64 -> TF.Shape -> TF.Build (TF.Tensor TF.Build Float)
-randomParam width (TF.Shape shape) =
+randomParam :: TF.Shape -> TF.Build (TF.Tensor TF.Build Float)
+randomParam (TF.Shape shape) =
     (`TF.mul` stddev) <$> TF.truncatedNormal (TF.vector shape)
   where
+    width = head shape
     stddev = TF.scalar (1 / sqrt (fromIntegral width))
 
 reduceMean :: TF.Tensor TF.Build Float -> TF.Tensor TF.Build Float
 reduceMean xs = TF.mean xs (TF.scalar (0 :: Int32))
 
--- Types must match due to model structure.
-type LabelType = Int32
+gradientDescent :: Float
+                -> TF.Tensor v Float
+                -> [TF.Tensor TF.Ref Float]
+                -> TF.Build TF.ControlNode
+gradientDescent alpha loss params = do
+    grads <- TF.gradients loss params
+    let applyGrad param grad =
+            TF.assign param (param `TF.sub` (TF.scalar alpha `TF.mul` grad))
+    controlNodes <- zipWithM applyGrad params grads
+    TF.group controlNodes
 
 data Model = Model {
-      train :: TF.TensorData Float  -- ^ images
-            -> TF.TensorData LabelType
-            -> TF.Session ()
-    , infer :: TF.TensorData Float  -- ^ images
-            -> TF.Session (V.Vector LabelType)  -- ^ predictions
-    , errorRate :: TF.TensorData Float  -- ^ images
-                -> TF.TensorData LabelType
+      train :: [V.Vector Word8]  -- ^ images
+            -> [Word8]           -- ^ labels
+            -> TF.Session Summary
+    , infer :: [V.Vector Word8]             -- ^ images
+            -> TF.Session (V.Vector Word8)  -- ^ predictions
+    , errorRate :: [V.Vector Word8]  -- ^ images
+                -> [Word8]           -- ^ labels
                 -> TF.Session Float
     }
+
+encodeImageBatch :: [V.Vector Word8] -> TF.TensorData Float
+encodeImageBatch xs =
+    TF.encodeTensorData [genericLength xs, numPixels]
+                        (fromIntegral <$> mconcat xs)
+
+encodeLabelBatch :: [Word8] -> TF.TensorData Word8
+encodeLabelBatch xs =
+    TF.encodeTensorData [genericLength xs]
+                        (fromIntegral <$> V.fromList xs)
+
+selectBatch :: Int -> Int -> [a] -> [a]
+selectBatch batchSize i xs = take batchSize $ drop (i * batchSize) (cycle xs)
 
 createModel :: TF.Build Model
 createModel = do
@@ -63,46 +76,52 @@ createModel = do
     let batchSize = -1
     -- Inputs.
     images <- TF.placeholder [batchSize, numPixels]
-    -- Hidden layer.
-    let numUnits = 500
-    hiddenWeights <-
-        TF.initializedVariable =<< randomParam numPixels [numPixels, numUnits]
-    hiddenBiases <- TF.zeroInitializedVariable [numUnits]
-    let hiddenZ = (images `TF.matMul` hiddenWeights) `TF.add` hiddenBiases
-    let hidden = TF.relu hiddenZ
-    -- Logits.
-    logitWeights <-
-        TF.initializedVariable =<< randomParam numUnits [numUnits, numLabels]
-    logitBiases <- TF.zeroInitializedVariable [numLabels]
-    let logits = (hidden `TF.matMul` logitWeights) `TF.add` logitBiases
-    predict <- TF.render $ TF.cast $
-               TF.argMax (TF.softmax logits) (TF.scalar (1 :: LabelType))
-
-    -- Create training action.
     labels <- TF.placeholder [batchSize]
-    let labelVecs = TF.oneHot labels (fromIntegral numLabels) 1 0
-        loss =
-            reduceMean $ fst $ TF.softmaxCrossEntropyWithLogits logits labelVecs
-        params = [hiddenWeights, hiddenBiases, logitWeights, logitBiases]
-    grads <- TF.gradients loss params
 
-    let lr = TF.scalar 0.00001
-        applyGrad param grad = TF.assign param $ param `TF.sub` (lr `TF.mul` grad)
-    trainStep <- TF.group =<< zipWithM applyGrad params grads
+    -- Variables.
+    hiddenWeights <- TF.initializedVariable =<< randomParam [numPixels, 500]
+    logitWeights <- TF.initializedVariable =<< randomParam [500, numLabels]
+    let trainableVariables = [hiddenWeights, logitWeights]
 
+    -- Network.
+    let hidden = TF.relu (images `TF.matMul` hiddenWeights)
+        logits = hidden `TF.matMul` logitWeights
+
+    -- Inference.
+    predict <- TF.render $ TF.cast $ TF.argMax logits (TF.scalar (1 :: Int32))
+
+    -- Evaluation.
     let correctPredictions = TF.equal predict labels
     errorRateTensor <- TF.render $ 1 - reduceMean (TF.cast correctPredictions)
 
+    -- Training.
+    -- Convert labels from digit indices to "one hot" vectors,
+    -- e.g. 3 becomes [0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+    let labelVecs = TF.oneHot labels (fromIntegral numLabels) 1 0
+    loss <- TF.render $ reduceMean $ fst $ TF.softmaxCrossEntropyWithLogits logits labelVecs
+    trainStep <- gradientDescent 1e-5 loss trainableVariables
+
+    TF.scalarSummary "loss" loss
+    TF.scalarSummary "errorRate" errorRateTensor
+    TF.histogramSummary "hiddenWeights" hiddenWeights
+    TF.histogramSummary "logitWeights" logitWeights
+    summaryTensor <- TF.mergeAllSummaries
+
     return Model {
-          train = \imFeed lFeed -> TF.runWithFeeds_ [
-                TF.feed images imFeed
-              , TF.feed labels lFeed
-              ] trainStep
-        , infer = \imFeed -> TF.runWithFeeds [TF.feed images imFeed] predict
-        , errorRate = \imFeed lFeed -> TF.unScalar <$> TF.runWithFeeds [
-                TF.feed images imFeed
-              , TF.feed labels lFeed
-              ] errorRateTensor
+          train = \imageBatch labelBatch -> do
+              let feeds = [ TF.feed images (encodeImageBatch imageBatch)
+                          , TF.feed labels (encodeLabelBatch labelBatch)
+                          ]
+              ((), summaryBytes) <- TF.runWithFeeds feeds (trainStep, summaryTensor)
+              return (decodeMessageOrDie (TF.unScalar summaryBytes))
+        , infer = \imageBatch -> do
+              let feeds = [TF.feed images (encodeImageBatch imageBatch)]
+              TF.runWithFeeds feeds predict
+        , errorRate = \imageBatch labelBatch -> do
+              let feeds = [ TF.feed images (encodeImageBatch imageBatch)
+                          , TF.feed labels (encodeLabelBatch labelBatch)
+                          ]
+              TF.unScalar <$> TF.runWithFeeds feeds errorRateTensor
         }
 
 main :: IO ()
@@ -116,35 +135,32 @@ main = TF.runSession $ do
     -- Create the model.
     model <- TF.build createModel
 
-    -- Functions for generating batches.
-    let encodeImageBatch xs =
-            TF.encodeTensorData [genericLength xs, numPixels]
-                                (fromIntegral <$> mconcat xs)
-    let encodeLabelBatch xs =
-            TF.encodeTensorData [genericLength xs]
-                                (fromIntegral <$> V.fromList xs)
-    let batchSize = 100
-    let selectBatch i xs = take batchSize $ drop (i * batchSize) (cycle xs)
+    -- forM_ ([0..500] :: [Int]) $ \i -> do
+    --     let images = selectBatch 100 i trainingImages
+    --         labels = selectBatch 100 i trainingLabels
+    --     _ <- train model images labels
 
-    -- Train.
-    forM_ ([0..1000] :: [Int]) $ \i -> do
-        let images = encodeImageBatch (selectBatch i trainingImages)
-            labels = encodeLabelBatch (selectBatch i trainingLabels)
-        train model images labels
-        when (i `mod` 100 == 0) $ do
-            err <- errorRate model images labels
-            liftIO $ putStrLn $ "training error " ++ show (err * 100)
+    TF.withEventWriter "/tmp/tflogs/demo1" $ \eventWriter -> do
+        forM_ ([0..500] :: [Int]) $ \i -> do
+            let images = selectBatch 100 i trainingImages
+                labels = selectBatch 100 i trainingLabels
+            summary <- train model images labels
+            TF.logSummary eventWriter (fromIntegral i) summary
+            when (i `mod` 10 == 0) $ do
+                err <- errorRate model images labels
+                liftIO $ putStrLn $ "training error " ++ show (err * 100)
     liftIO $ putStrLn ""
 
     -- Test.
-    testErr <- errorRate model (encodeImageBatch testImages)
-                               (encodeLabelBatch testLabels)
+    testErr <- errorRate model testImages testLabels
     liftIO $ putStrLn $ "test error " ++ show (testErr * 100)
 
     -- Show some predictions.
-    testPreds <- infer model (encodeImageBatch testImages)
-    liftIO $ forM_ ([0..3] :: [Int]) $ \i -> do
+    testPreds <- infer model testImages
+    liftIO $ forM_ ([0..] :: [Int]) $ \i -> do
         putStrLn ""
         T.putStrLn $ drawMNIST $ testImages !! i
         putStrLn $ "expected " ++ show (testLabels !! i)
         putStrLn $ "     got " ++ show (testPreds V.! i)
+        _ <- getLine
+        return ()
