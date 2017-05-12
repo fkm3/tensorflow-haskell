@@ -17,6 +17,7 @@ library
                  , TensorFlow.Ops
                  , TensorFlow.EmbeddingOps
                  , TensorFlow.Variable
+                 , TensorFlow.Optimizers
   build-depends:  proto-lens == 0.2.*
                 , base >= 4.7 && < 5
                 , bytestring
