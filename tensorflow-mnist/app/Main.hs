@@ -26,6 +26,7 @@ import qualified TensorFlow.Core as TF
 import qualified TensorFlow.Gradient as TF
 import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializedVariable)
 import qualified TensorFlow.Variable as TF
+import qualified TensorFlow.Minimize as TF
 
 import TensorFlow.Examples.MNIST.InputData
 import TensorFlow.Examples.MNIST.Parse
@@ -87,11 +88,7 @@ createModel = do
         loss =
             reduceMean $ fst $ TF.softmaxCrossEntropyWithLogits logits labelVecs
         params = [hiddenWeights, hiddenBiases, logitWeights, logitBiases]
-    grads <- TF.gradients loss params
-
-    let lr = TF.scalar 0.00001
-        applyGrad param grad = TF.assignAdd param (negate $ lr `TF.mul` grad)
-    trainStep <- TF.group =<< zipWithM applyGrad params grads
+    trainStep <- TF.minimizeWith TF.adam loss params
 
     let correctPredictions = TF.equal predict labels
     errorRateTensor <- TF.render $ 1 - reduceMean (TF.cast correctPredictions)
@@ -144,10 +141,10 @@ main = TF.runSession $ do
                                (encodeLabelBatch testLabels)
     liftIO $ putStrLn $ "test error " ++ show (testErr * 100)
 
-    -- Show some predictions.
-    testPreds <- infer model (encodeImageBatch testImages)
-    liftIO $ forM_ ([0..3] :: [Int]) $ \i -> do
-        putStrLn ""
-        T.putStrLn $ drawMNIST $ testImages !! i
-        putStrLn $ "expected " ++ show (testLabels !! i)
-        putStrLn $ "     got " ++ show (testPreds V.! i)
+    -- -- Show some predictions.
+    -- testPreds <- infer model (encodeImageBatch testImages)
+    -- liftIO $ forM_ ([0..3] :: [Int]) $ \i -> do
+    --     putStrLn ""
+    --     T.putStrLn $ drawMNIST $ testImages !! i
+    --     putStrLn $ "expected " ++ show (testLabels !! i)
+    --     putStrLn $ "     got " ++ show (testPreds V.! i)
