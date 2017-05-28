@@ -134,6 +134,8 @@ module TensorFlow.Ops
     , CoreOps.sub'
     , CoreOps.sum
     , CoreOps.sum'
+    , reduceMean
+    , reduceMean'
     , reduceSum
     , reduceSum'
     , CoreOps.transpose
@@ -319,19 +321,32 @@ scalarize t = CoreOps.reshape t (vector scalarShape)
     where
         scalarShape = [] :: [Int32]
 
+allAxes :: TensorType a => Tensor v a -> Tensor Build Int32
+allAxes x = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+
 -- | Sum a tensor down to a scalar
 -- Seee `TensorFlow.GenOps.Core.sum`
 reduceSum :: (OneOf '[ Double, Float, Int32, Int64
                      , Complex Float, Complex Double] a) =>
              Tensor v a -> Tensor Build a
-reduceSum x = CoreOps.sum x allAxes
-  where allAxes = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+reduceSum x = CoreOps.sum x (allAxes x)
 
 reduceSum' :: (OneOf '[ Double, Float, Int32, Int64
                       , Complex Float, Complex Double] a) =>
               OpParams -> Tensor v a -> Tensor Build a
-reduceSum' params x = CoreOps.sum' params x allAxes
-  where allAxes = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+reduceSum' params x = CoreOps.sum' params x (allAxes x)
+
+-- | Mean of all elements of a tensor.
+-- Seee `TensorFlow.GenOps.Core.mean`
+reduceMean :: (OneOf '[ Double, Float, Int32, Int64
+                     , Complex Float, Complex Double] a) =>
+             Tensor v a -> Tensor Build a
+reduceMean x = CoreOps.mean x (allAxes x)
+
+reduceMean' :: (OneOf '[ Double, Float, Int32, Int64
+                      , Complex Float, Complex Double] a) =>
+              OpParams -> Tensor v a -> Tensor Build a
+reduceMean' params x = CoreOps.mean' params x (allAxes x)
 
 -- | Create a constant vector.
 vector :: TensorType a => [a] -> Tensor Build a

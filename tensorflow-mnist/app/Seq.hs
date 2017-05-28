@@ -30,6 +30,7 @@ import MonadUtils (mapAccumLM)
 import Data.Char (toLower)
 import Data.Int (Int32, Int64)
 import Data.List (genericLength)
+import Data.List.Split (splitOn)
 import Debug.Trace
 import Lens.Family2 ((.~))
 import qualified Data.Map as Map
@@ -46,12 +47,6 @@ import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializ
 import qualified TensorFlow.RNN as TF
 import qualified TensorFlow.Variable as TF
 
-
-reduceMean :: TF.Tensor v Float -> TF.Tensor TF.Build Float
-reduceMean xs = TF.mean xs (TF.range 0 (TF.rank xs) 1)
-
-reduceSum :: TF.Tensor v Float -> TF.Tensor TF.Build Float
-reduceSum xs = TF.sum xs (TF.range 0 (TF.rank xs) 1)
 
 data Model = Model {
       train :: TF.TensorData Int32  -- ^ Inputs. [batch, timestep]
@@ -111,13 +106,13 @@ createModel maxSeqLen vocabSize inferLength = do
         flatLabels = (TF.reshape labelVecs (TF.vector [-1, fromIntegral vocabSize :: Int32]))
         flatMask = (TF.reshape mask (TF.vector [-1 :: Int32]))
         losses = fst $ TF.softmaxCrossEntropyWithLogits flatLogits flatLabels
-    loss <- TF.render $ reduceSum (losses * flatMask) `TF.div` reduceSum flatMask
+    loss <- TF.render $ TF.reduceSum (losses * flatMask) `TF.div` TF.reduceSum flatMask
     --  trainStep <- TF.gradientDescent 1e-2 loss allParams
     trainStep <- TF.minimizeWith TF.adam loss allParams
 
     let correctPredictions = TF.equal predict labels
     errorRateTensor <-
-        TF.render $ 1 - reduceSum (mask `TF.mul` TF.cast correctPredictions) `TF.div` reduceSum mask
+        TF.render $ 1 - TF.reduceSum (mask `TF.mul` TF.cast correctPredictions) `TF.div` TF.reduceSum mask
 
     return Model {
           train = \inputsFeed labelsFeed maskFeed -> do
@@ -141,7 +136,11 @@ processDataset examples =
     (fromIntegral maxSeqLen, fromIntegral vocabSize, idToWord, map toVecs examples')
   where
     -- examples' = map (words . map toLower) examples
-    examples' = map (map toLower) examples
+    -- examples' = map (map toLower) examples
+    examples' = concatMap (map (take 1000)
+                           . filter (not . null)
+                           . splitOn "\n\n"
+                           . map toLower) examples
     maxSeqLen = maximum (map length examples')
     vocab = Set.fromList (concat examples')
     -- 0 is reserved for null.
@@ -165,7 +164,7 @@ main = TF.runSession $ do
     --               ]
 
     -- dataset <- filter (not . null) . lines <$> liftIO (readFile "tensorflow/src/TensorFlow/Build.hs")
-    dataset <- liftIO (mapM (fmap (take 1000) . readFile) =<< glob "tensorflow/src/**/*.hs")
+    dataset <- liftIO (mapM readFile =<< glob "*/src/**/*.hs")
 
     let (maxSeqLen, vocabSize, idToWord, examples) = processDataset dataset
 
@@ -196,7 +195,7 @@ main = TF.runSession $ do
         if i `mod` 100 == 0
             then do
                 (loss, err) <- train model seqBatch labelBatch maskBatch
-                liftIO $ putStrLn $ "step " ++ show i ++ " training error " ++ show err ++ " loss " ++ show loss
+                liftIO $ putStrLn $ "\nstep " ++ show i ++ " training error " ++ show err ++ " loss " ++ show loss
                 liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
             else do
                 _ <- train model seqBatch labelBatch maskBatch

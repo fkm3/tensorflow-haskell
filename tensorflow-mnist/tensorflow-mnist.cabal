@@ -76,6 +76,7 @@ executable Seq
                , transformers
                , vector
                , Glob
+               , split
 
 Test-Suite ParseTest
   default-language: Haskell2010
