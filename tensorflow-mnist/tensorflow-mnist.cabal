@@ -66,6 +66,7 @@ executable Seq
                , tensorflow-proto == 0.1.*
                , tensorflow-core-ops == 0.1.*
                , tensorflow-ops == 0.1.*
+               , tensorflow-logging == 0.1.*
                , ghc
                , random-extras
                , random-fu
@@ -78,6 +79,7 @@ executable Seq
                , split
                , lens
                , lens-aeson
+               , optparse-applicative
 
 Test-Suite ParseTest
   default-language: Haskell2010

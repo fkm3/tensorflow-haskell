@@ -13,7 +13,6 @@
 -- limitations under the License.
 
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -28,12 +27,15 @@ import Data.List (genericLength)
 import Data.List.Split (splitOn)
 import Data.Maybe (fromJust)
 import Data.Monoid ((<>))
+import Data.ProtoLens (decodeMessageOrDie)
 import Data.Random (StdRandom(..))
 import Data.Random.Extras (sample)
 import Data.Random.RVar (runRVar)
 import Data.Tuple (swap)
 import Debug.Trace
 import MonadUtils (mapAccumLM)
+import Options.Applicative as OptParse
+import Proto.Tensorflow.Core.Framework.Summary (Summary)
 import System.FilePath.Glob (glob)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -44,6 +46,7 @@ import qualified TensorFlow.Core as TF
 import qualified TensorFlow.GenOps.Core as TF (sigmoid, tanh, div, rank, squeeze', multinomial, applyAdam)
 import qualified TensorFlow.Gradient as TF
 import qualified TensorFlow.Initializers as TF
+import qualified TensorFlow.Logging as TF
 import qualified TensorFlow.Minimize as TF
 import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializedVariable)
 import qualified TensorFlow.RNN as TF
@@ -54,7 +57,7 @@ data Model = Model {
       train :: TF.TensorData Int32  -- ^ Inputs. [batch, timestep]
             -> TF.TensorData Int32  -- ^ Labels. [batch, timestep]
             -> TF.TensorData Float  -- ^ Mask. [batch, timestep]
-            -> TF.Session (Float, Float)     -- ^ Loss and error rate.
+            -> TF.Session Summary
     , infer :: TF.Session [Int32]
     , errorRate :: TF.TensorData Int32  -- ^ Inputs. [batch, timestep]
                 -> TF.TensorData Int32  -- ^ Labels. [batch, timestep]
@@ -72,13 +75,13 @@ createModel maxSeqLen vocabSize inferLength = do
     -- Use -1 batch size to support variable sized batches.
     let batchSize = -1
     -- Inputs.
-    inputs <- TF.placeholder' (TF.opName .~ "inputs") [batchSize, maxSeqLen]
-    mask <- TF.placeholder [batchSize, maxSeqLen]
+    inputs <- TF.placeholder' (TF.opName .~ "inputs") (TF.Shape [batchSize, maxSeqLen])
+    mask <- TF.placeholder (TF.Shape [batchSize, maxSeqLen])
 
     let hiddenSize = 128
     (rnn, zeroStateLike, rnnParams) <- TF.lstm vocabSize hiddenSize
-    logitWeights <- TF.initializedVariable =<< TF.xavierInitializer [hiddenSize, vocabSize]
-    logitBiases <- TF.zeroInitializedVariable [vocabSize]
+    logitWeights <- TF.initializedVariable =<< TF.xavierInitializer (TF.Shape [hiddenSize, vocabSize])
+    logitBiases <- TF.zeroInitializedVariable (TF.Shape [vocabSize])
     let allParams = rnnParams ++ [logitWeights, logitBiases]
 
     let sequences :: [TF.Tensor TF.Build Float]
@@ -87,7 +90,7 @@ createModel maxSeqLen vocabSize inferLength = do
     let logits' = map (\x -> x `TF.matMul` TF.readValue logitWeights + TF.readValue logitBiases) rnnOutputs
         logits = pack 1 logits'
 
-    let zeroInput = TF.zeros [1, vocabSize]
+    let zeroInput = TF.zeros (TF.Shape [1, vocabSize])
     inferResults <- flip unfoldrM (zeroStateLike zeroInput, zeroInput, 0) $ \(s, x, i) ->
         if i == inferLength
             then return Nothing
@@ -102,7 +105,7 @@ createModel maxSeqLen vocabSize inferLength = do
     predict <- TF.render $ TF.cast $ TF.argMax logits (TF.scalar (2 :: Int64))
 
     -- Create training action.
-    labels <- TF.placeholder [batchSize, maxSeqLen] :: TF.Build (TF.Tensor TF.Value Int32)
+    labels <- TF.placeholder (TF.Shape [batchSize, maxSeqLen]) :: TF.Build (TF.Tensor TF.Value Int32)
     let labelVecs = TF.oneHot labels (fromIntegral vocabSize) 1 0 :: TF.Tensor TF.Build Float
         flatLogits = (TF.reshape logits (TF.vector [-1, fromIntegral vocabSize :: Int32]))
         flatLabels = (TF.reshape labelVecs (TF.vector [-1, fromIntegral vocabSize :: Int32]))
@@ -116,15 +119,18 @@ createModel maxSeqLen vocabSize inferLength = do
     errorRateTensor <-
         TF.render $ 1 - TF.reduceSum (mask `TF.mul` TF.cast correctPredictions) `TF.div` TF.reduceSum mask
 
+    TF.scalarSummary "loss" loss
+    TF.scalarSummary "errorRate" errorRateTensor
+    allSummaries <- TF.mergeAllSummaries
+
     return Model {
           train = \inputsFeed labelsFeed maskFeed -> do
               let feeds = [ TF.feed inputs inputsFeed
                           , TF.feed labels labelsFeed
                           , TF.feed mask maskFeed
                           ]
-              ((), TF.Scalar l, TF.Scalar e) <-
-                  TF.runWithFeeds feeds (trainStep, loss, errorRateTensor)
-              return (l, e)
+              decodeMessageOrDie . TF.unScalar . snd
+                  <$> TF.runWithFeeds feeds (trainStep, allSummaries)
         , infer = S.toList <$> TF.runWithFeeds [] infer
         , errorRate = \inputsFeed labelsFeed maskFeed -> TF.unScalar <$> TF.runWithFeeds [
                 TF.feed inputs inputsFeed
@@ -167,8 +173,17 @@ getJokeExamples path = do
             (x ^. key "title" . _String) <> "\n\n" <> (x ^. key "body" . _String))
     return (map Text.unpack examples)
 
+data Options = Options { optionsRunName :: String }
+
+optionsParser :: OptParse.Parser Options
+optionsParser = Options <$>
+    OptParse.strOption (OptParse.long "run_name"
+                        <> OptParse.help "Run name to use for tensorboard logs.")
+
 main :: IO ()
 main = TF.runSession $ do
+    opts <- liftIO (OptParse.execParser (OptParse.info optionsParser OptParse.fullDesc))
+
     -- let dataset = [ "Some simple examples."
     --               , "Another example."
     --               , "Third example!"
@@ -185,11 +200,11 @@ main = TF.runSession $ do
 
     let sampleBatch = do
             xs <- liftIO (runRVar (sample 32 examples) StdRandom)
-            let seqBatch = TF.encodeTensorData [genericLength xs, maxSeqLen]
+            let seqBatch = TF.encodeTensorData(TF.Shape  [genericLength xs, maxSeqLen])
                                               (mconcat (map exampleInputs xs))
-                labelBatch = TF.encodeTensorData [genericLength xs, maxSeqLen]
+                labelBatch = TF.encodeTensorData (TF.Shape [genericLength xs, maxSeqLen])
                                                 (mconcat (map exampleLabels xs))
-                maskBatch = TF.encodeTensorData [genericLength xs, maxSeqLen]
+                maskBatch = TF.encodeTensorData (TF.Shape [genericLength xs, maxSeqLen])
                                                 (mconcat (map exampleMask xs))
             return (seqBatch, labelBatch, maskBatch)
 
@@ -200,16 +215,18 @@ main = TF.runSession $ do
     model <- TF.build (createModel maxSeqLen vocabSize maxSeqLen)
 
     let generateText = map (fromJust . flip Map.lookup idToWord) . takeWhile (/= 0) <$> infer model
-    liftIO . putStrLn =<< generateText
 
     -- Train.
     liftIO $ putStrLn "Starting training..."
-    forM_ ([0..100000] :: [Int]) $ \i -> do
-        (seqBatch, labelBatch, maskBatch) <- sampleBatch
-        (loss, err) <- train model seqBatch labelBatch maskBatch
-        when (i `mod` 100 == 99) $ do
-            liftIO $ putStrLn $ "\nstep " ++ show i ++ " training error " ++ show err ++ " loss " ++ show loss
-            liftIO . putStrLn =<< generateText
+    TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts) $ \eventWriter -> do
+        forM_ [0..100000] $ \i -> do
+            (seqBatch, labelBatch, maskBatch) <- sampleBatch
+            summary <- train model seqBatch labelBatch maskBatch
+            TF.logSummary eventWriter i summary
+            when (i `mod` 100 == 0) $ do
+                liftIO . putStrLn $ "step " ++ show i
+                liftIO . putStrLn =<< generateText
+                liftIO . putStrLn $ "\n"
 
     liftIO $ putStrLn "Finished training."
     liftIO . putStrLn =<< generateText
