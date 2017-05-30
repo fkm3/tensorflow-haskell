@@ -58,6 +58,10 @@ data Model = Model {
             -> TF.TensorData Int32  -- ^ Labels. [batch, timestep]
             -> TF.TensorData Float  -- ^ Mask. [batch, timestep]
             -> TF.Session Summary
+    , eval :: TF.TensorData Int32  -- ^ Inputs. [batch, timestep]
+           -> TF.TensorData Int32  -- ^ Labels. [batch, timestep]
+           -> TF.TensorData Float  -- ^ Mask. [batch, timestep]
+           -> TF.Session Summary
     , infer :: TF.Session [Int32]
     , errorRate :: TF.TensorData Int32  -- ^ Inputs. [batch, timestep]
                 -> TF.TensorData Int32  -- ^ Labels. [batch, timestep]
@@ -78,7 +82,7 @@ createModel maxSeqLen vocabSize inferLength = do
     inputs <- TF.placeholder' (TF.opName .~ "inputs") (TF.Shape [batchSize, maxSeqLen])
     mask <- TF.placeholder (TF.Shape [batchSize, maxSeqLen])
 
-    let hiddenSize = 128
+    let hiddenSize = 512
     (rnn, zeroStateLike, rnnParams) <- TF.lstm vocabSize hiddenSize
     logitWeights <- TF.initializedVariable =<< TF.xavierInitializer (TF.Shape [hiddenSize, vocabSize])
     logitBiases <- TF.zeroInitializedVariable (TF.Shape [vocabSize])
@@ -131,6 +135,12 @@ createModel maxSeqLen vocabSize inferLength = do
                           ]
               decodeMessageOrDie . TF.unScalar . snd
                   <$> TF.runWithFeeds feeds (trainStep, allSummaries)
+        , eval = \inputsFeed labelsFeed maskFeed -> do
+              let feeds = [ TF.feed inputs inputsFeed
+                          , TF.feed labels labelsFeed
+                          , TF.feed mask maskFeed
+                          ]
+              decodeMessageOrDie . TF.unScalar <$> TF.runWithFeeds feeds allSummaries
         , infer = S.toList <$> TF.runWithFeeds [] infer
         , errorRate = \inputsFeed labelsFeed maskFeed -> TF.unScalar <$> TF.runWithFeeds [
                 TF.feed inputs inputsFeed
@@ -195,18 +205,20 @@ main = TF.runSession $ do
     dataset <- liftIO (getJokeExamples "/opt/datasets/joke-dataset/reddit_jokes.json")
 
     let (maxSeqLen, vocabSize, idToWord, examples) = processDataset dataset
+        (devExamples, trainExamples) = splitAt 512 examples
 
-    -- liftIO (print examples)
-
-    let sampleBatch = do
-            xs <- liftIO (runRVar (sample 32 examples) StdRandom)
+    let prepareBatch xs =
             let seqBatch = TF.encodeTensorData(TF.Shape  [genericLength xs, maxSeqLen])
                                               (mconcat (map exampleInputs xs))
                 labelBatch = TF.encodeTensorData (TF.Shape [genericLength xs, maxSeqLen])
                                                 (mconcat (map exampleLabels xs))
                 maskBatch = TF.encodeTensorData (TF.Shape [genericLength xs, maxSeqLen])
                                                 (mconcat (map exampleMask xs))
-            return (seqBatch, labelBatch, maskBatch)
+            in (seqBatch, labelBatch, maskBatch)
+        (devSeqBatch, devLabelBatch, devMaskBatch) = prepareBatch devExamples
+        sampleBatch xs = liftIO (prepareBatch <$> runRVar (sample 32 xs) StdRandom)
+
+    -- liftIO (print examples)
 
     -- Create the model.
     liftIO $ putStrLn $ "max sequence length: " ++ show maxSeqLen
@@ -218,12 +230,13 @@ main = TF.runSession $ do
 
     -- Train.
     liftIO $ putStrLn "Starting training..."
-    TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts) $ \eventWriter -> do
+    TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts) $ \eventWriter ->
+      TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts <> "_dev") $ \devEventWriter -> do
         forM_ [0..100000] $ \i -> do
-            (seqBatch, labelBatch, maskBatch) <- sampleBatch
-            summary <- train model seqBatch labelBatch maskBatch
-            TF.logSummary eventWriter i summary
+            (seqBatch, labelBatch, maskBatch) <- sampleBatch trainExamples
+            TF.logSummary eventWriter i =<< train model seqBatch labelBatch maskBatch
             when (i `mod` 100 == 0) $ do
+                TF.logSummary devEventWriter i =<< eval model devSeqBatch devLabelBatch devMaskBatch
                 liftIO . putStrLn $ "step " ++ show i
                 liftIO . putStrLn =<< generateText
                 liftIO . putStrLn $ "\n"
