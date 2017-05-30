@@ -17,25 +17,27 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-import System.FilePath.Glob (glob)
-import Data.Random (StdRandom(..))
-import Data.Random.RVar (runRVar)
-import Data.Random.Extras (sample)
-import Data.Maybe (fromJust)
-import Data.Tuple (swap)
-import Control.Monad.Loops (unfoldrM)
+import Control.Lens ((^.), (^..), (.~), to)
 import Control.Monad ((>=>), zipWithM, when, forM_)
 import Control.Monad.IO.Class (liftIO)
-import MonadUtils (mapAccumLM)
-import Data.Char (toLower)
+import Control.Monad.Loops (unfoldrM)
+import Data.Aeson.Lens (values, key, _String)
+import Data.Char (toLower, isAscii)
 import Data.Int (Int32, Int64)
 import Data.List (genericLength)
 import Data.List.Split (splitOn)
+import Data.Maybe (fromJust)
+import Data.Monoid ((<>))
+import Data.Random (StdRandom(..))
+import Data.Random.Extras (sample)
+import Data.Random.RVar (runRVar)
+import Data.Tuple (swap)
 import Debug.Trace
-import Lens.Family2 ((.~))
+import MonadUtils (mapAccumLM)
+import System.FilePath.Glob (glob)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.Text.IO as T
+import qualified Data.Text as Text
 import qualified Data.Vector.Storable as S
 
 import qualified TensorFlow.Core as TF
@@ -86,7 +88,7 @@ createModel maxSeqLen vocabSize inferLength = do
         logits = pack 1 logits'
 
     let zeroInput = TF.zeros [1, vocabSize]
-    inferResults <- flip unfoldrM (zeroStateLike zeroInput, zeroInput, 0) $ \(s, x, i) -> do
+    inferResults <- flip unfoldrM (zeroStateLike zeroInput, zeroInput, 0) $ \(s, x, i) ->
         if i == inferLength
             then return Nothing
             else do
@@ -131,30 +133,39 @@ createModel maxSeqLen vocabSize inferLength = do
               ] errorRateTensor
         }
 
-processDataset :: [String] -> (Int64, Int64, Map.Map Int32 Char, [(S.Vector Int32, S.Vector Int32, S.Vector Float)])
+data Example = Example
+    { exampleInputs :: S.Vector Int32
+    , exampleLabels :: S.Vector Int32
+    , exampleMask   :: S.Vector Float
+    }
+
+processDataset :: [String] -> (Int64, Int64, Map.Map Int32 Char, [Example])
 processDataset examples =
-    (fromIntegral maxSeqLen, fromIntegral vocabSize, idToWord, map toVecs examples')
+    (fromIntegral maxSeqLen, fromIntegral vocabSize, idToWord, map toExample examples')
   where
     -- examples' = map (words . map toLower) examples
-    -- examples' = map (map toLower) examples
-    examples' = concatMap (map (take 1000)
-                           . filter (not . null)
-                           . splitOn "\n\n"
-                           . map toLower) examples
+    examples' = filter (all isAscii) $ filter ((<1000) . length) $ map (map toLower) examples
+    -- examples' = concatMap (map (take 1000)
+    --                        . filter (not . null)
+    --                        . splitOn "\n\n"
+    --                        . map toLower) examples
     maxSeqLen = maximum (map length examples')
     vocab = Set.fromList (concat examples')
     -- 0 is reserved for null.
     vocabSize = Set.size vocab + 1
     wordToID = Map.fromList (zip ('▒' : Set.toList vocab) [0..])
     idToWord = Map.fromList (map swap (Map.toList wordToID))
-    toVecs xs = ( S.fromList (map (wordToID Map.!) xs
-                              ++ replicate (maxSeqLen - length xs) 0)
-                , S.fromList (tail (map (wordToID Map.!) xs)
-                              ++ replicate (maxSeqLen - length xs + 1) 0)
-                , S.fromList (replicate (length xs) 1
-                              ++ replicate (maxSeqLen - length xs) 0)
-                )
+    toExample xs = Example
+        (S.fromList (map (wordToID Map.!) xs        ++ replicate (maxSeqLen - length xs) 0))
+        (S.fromList (tail (map (wordToID Map.!) xs) ++ replicate (maxSeqLen - length xs + 1) 0))
+        (S.fromList (replicate (length xs) 1        ++ replicate (maxSeqLen - length xs) 0))
 
+getJokeExamples :: String -> IO [String]
+getJokeExamples path = do
+    contents <- readFile path
+    let examples = contents ^.. values . to (\x ->
+            (x ^. key "title" . _String) <> "\n\n" <> (x ^. key "body" . _String))
+    return (map Text.unpack examples)
 
 main :: IO ()
 main = TF.runSession $ do
@@ -164,7 +175,9 @@ main = TF.runSession $ do
     --               ]
 
     -- dataset <- filter (not . null) . lines <$> liftIO (readFile "tensorflow/src/TensorFlow/Build.hs")
-    dataset <- liftIO (mapM readFile =<< glob "*/src/**/*.hs")
+    -- dataset <- liftIO (mapM readFile =<< glob "*/src/**/*.hs")
+
+    dataset <- liftIO (getJokeExamples "/opt/datasets/joke-dataset/reddit_jokes.json")
 
     let (maxSeqLen, vocabSize, idToWord, examples) = processDataset dataset
 
@@ -172,12 +185,12 @@ main = TF.runSession $ do
 
     let sampleBatch = do
             xs <- liftIO (runRVar (sample 32 examples) StdRandom)
-            let seqBatch = TF.encodeTensorData [genericLength examples, maxSeqLen]
-                                              (mconcat (map (\(x, _, _) -> x) examples))
-                labelBatch = TF.encodeTensorData [genericLength examples, maxSeqLen]
-                                                (mconcat (map (\(_, x, _) -> x) examples))
-                maskBatch = TF.encodeTensorData [genericLength examples, maxSeqLen]
-                                                (mconcat (map (\(_, _, x) -> x) examples))
+            let seqBatch = TF.encodeTensorData [genericLength xs, maxSeqLen]
+                                              (mconcat (map exampleInputs xs))
+                labelBatch = TF.encodeTensorData [genericLength xs, maxSeqLen]
+                                                (mconcat (map exampleLabels xs))
+                maskBatch = TF.encodeTensorData [genericLength xs, maxSeqLen]
+                                                (mconcat (map exampleMask xs))
             return (seqBatch, labelBatch, maskBatch)
 
     -- Create the model.
@@ -186,23 +199,20 @@ main = TF.runSession $ do
     liftIO $ putStrLn "Creating model"
     model <- TF.build (createModel maxSeqLen vocabSize maxSeqLen)
 
-    liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
+    let generateText = map (fromJust . flip Map.lookup idToWord) . takeWhile (/= 0) <$> infer model
+    liftIO . putStrLn =<< generateText
 
     -- Train.
     liftIO $ putStrLn "Starting training..."
     forM_ ([0..100000] :: [Int]) $ \i -> do
         (seqBatch, labelBatch, maskBatch) <- sampleBatch
-        if i `mod` 100 == 0
-            then do
-                (loss, err) <- train model seqBatch labelBatch maskBatch
-                liftIO $ putStrLn $ "\nstep " ++ show i ++ " training error " ++ show err ++ " loss " ++ show loss
-                liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
-            else do
-                _ <- train model seqBatch labelBatch maskBatch
-                return ()
+        (loss, err) <- train model seqBatch labelBatch maskBatch
+        when (i `mod` 100 == 99) $ do
+            liftIO $ putStrLn $ "\nstep " ++ show i ++ " training error " ++ show err ++ " loss " ++ show loss
+            liftIO . putStrLn =<< generateText
 
     liftIO $ putStrLn "Finished training."
-    liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
-    liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
-    liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
-    liftIO . putStrLn . map (fromJust . flip Map.lookup idToWord) =<< infer model
+    liftIO . putStrLn =<< generateText
+    liftIO . putStrLn =<< generateText
+    liftIO . putStrLn =<< generateText
+    liftIO . putStrLn =<< generateText
