@@ -43,7 +43,7 @@ import qualified Data.Text as Text
 import qualified Data.Vector.Storable as S
 
 import qualified TensorFlow.Core as TF
-import qualified TensorFlow.GenOps.Core as TF (sigmoid, tanh, div, rank, squeeze', multinomial, applyAdam)
+import qualified TensorFlow.GenOps.Core as TF (sigmoid, tanh, div, rank, squeeze', multinomial, applyAdam, l2Loss)
 import qualified TensorFlow.Gradient as TF
 import qualified TensorFlow.Initializers as TF
 import qualified TensorFlow.Logging as TF
@@ -51,6 +51,11 @@ import qualified TensorFlow.Minimize as TF
 import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializedVariable)
 import qualified TensorFlow.RNN as TF
 import qualified TensorFlow.Variable as TF
+
+   
+-- TODO: Training and dev set error diverge quickly. Try dropout?
+-- Might want to try a longer run first.
+
 
 
 data Model = Model {
@@ -72,10 +77,6 @@ data Model = Model {
 
 createModel :: Int64 -> Int64 -> Int64 -> TF.Build Model
 createModel maxSeqLen vocabSize inferLength = do
-    let pack axis = TF.pack' (TF.opAttr "axis" .~ (axis :: Int64))
-        unpack axis = TF.unpack' (TF.opAttr "axis" .~ (axis :: Int64))
-        squeeze xs = TF.squeeze' (TF.opAttr "squeeze_dims" .~ (xs :: [Int64]))
-
     -- Use -1 batch size to support variable sized batches.
     let batchSize = -1
     -- Inputs.
@@ -89,10 +90,10 @@ createModel maxSeqLen vocabSize inferLength = do
     let allParams = rnnParams ++ [logitWeights, logitBiases]
 
     let sequences :: [TF.Tensor TF.Build Float]
-        sequences = unpack 1 maxSeqLen (TF.oneHot inputs (fromIntegral vocabSize) 1 0)
+        sequences = TF.unpack 1 maxSeqLen (TF.oneHot inputs (fromIntegral vocabSize) 1 0)
     (_, rnnOutputs) <- mapAccumLM rnn (zeroStateLike (head sequences)) sequences
     let logits' = map (\x -> x `TF.matMul` TF.readValue logitWeights + TF.readValue logitBiases) rnnOutputs
-        logits = pack 1 logits'
+        logits = TF.pack 1 logits'
 
     let zeroInput = TF.zeros (TF.Shape [1, vocabSize])
     inferResults <- flip unfoldrM (zeroStateLike zeroInput, zeroInput, 0) $ \(s, x, i) ->
@@ -101,10 +102,10 @@ createModel maxSeqLen vocabSize inferLength = do
             else do
                 (s', rnnOutput) <- rnn s x
                 let logits = rnnOutput `TF.matMul` TF.readValue logitWeights + TF.readValue logitBiases
-                chosenWords <- squeeze [1] <$> TF.multinomial logits 1
+                chosenWords <- TF.squeeze [1] <$> TF.multinomial logits 1
                 x' <- TF.render (TF.oneHot chosenWords (fromIntegral vocabSize) 1 0)
                 return (Just (chosenWords, (s', TF.expr x', i + 1)))
-    infer <- TF.render (TF.cast $ pack 1 inferResults)
+    infer <- TF.render (TF.cast $ TF.pack 1 inferResults)
 
     predict <- TF.render $ TF.cast $ TF.argMax logits (TF.scalar (2 :: Int64))
 
@@ -117,7 +118,11 @@ createModel maxSeqLen vocabSize inferLength = do
         losses = fst $ TF.softmaxCrossEntropyWithLogits flatLogits flatLabels
     loss <- TF.render $ TF.reduceSum (losses * flatMask) `TF.div` TF.reduceSum flatMask
     --  trainStep <- TF.gradientDescent 1e-2 loss allParams
-    trainStep <- TF.minimizeWith TF.adam loss allParams
+    gradients <- TF.gradients loss allParams
+    let gradientNorm = TF.globalNorm gradients
+    clippedGradients <- mapM TF.render (TF.clipByGlobalNorm 10 gradients)
+    trainStep <- TF.adam allParams clippedGradients
+    -- trainStep <- TF.adam allParams gradients
 
     let correctPredictions = TF.equal predict labels
     errorRateTensor <-
@@ -125,7 +130,11 @@ createModel maxSeqLen vocabSize inferLength = do
 
     TF.scalarSummary "loss" loss
     TF.scalarSummary "errorRate" errorRateTensor
-    allSummaries <- TF.mergeAllSummaries
+    evalSummaries <- TF.mergeAllSummaries
+    -- Don't include the gradient norm in the eval summaries,
+    -- otherwise eval would be as expensive as training.
+    TF.scalarSummary "gradientNorm" gradientNorm
+    trainSummaries <- TF.mergeAllSummaries
 
     return Model {
           train = \inputsFeed labelsFeed maskFeed -> do
@@ -134,13 +143,13 @@ createModel maxSeqLen vocabSize inferLength = do
                           , TF.feed mask maskFeed
                           ]
               decodeMessageOrDie . TF.unScalar . snd
-                  <$> TF.runWithFeeds feeds (trainStep, allSummaries)
+                  <$> TF.runWithFeeds feeds (trainStep, trainSummaries)
         , eval = \inputsFeed labelsFeed maskFeed -> do
               let feeds = [ TF.feed inputs inputsFeed
                           , TF.feed labels labelsFeed
                           , TF.feed mask maskFeed
                           ]
-              decodeMessageOrDie . TF.unScalar <$> TF.runWithFeeds feeds allSummaries
+              decodeMessageOrDie . TF.unScalar <$> TF.runWithFeeds feeds evalSummaries
         , infer = S.toList <$> TF.runWithFeeds [] infer
         , errorRate = \inputsFeed labelsFeed maskFeed -> TF.unScalar <$> TF.runWithFeeds [
                 TF.feed inputs inputsFeed
@@ -231,7 +240,7 @@ main = TF.runSession $ do
     -- Train.
     liftIO $ putStrLn "Starting training..."
     TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts) $ \eventWriter ->
-      TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts <> "_dev") $ \devEventWriter -> do
+      TF.withEventWriter ("seq_tflogs/" <> optionsRunName opts <> "_dev") $ \devEventWriter -> do
         forM_ [0..100000] $ \i -> do
             (seqBatch, labelBatch, maskBatch) <- sampleBatch trainExamples
             TF.logSummary eventWriter i =<< train model seqBatch labelBatch maskBatch

@@ -99,8 +99,6 @@ module TensorFlow.Ops
     , CoreOps.neg'
     , CoreOps.oneHot
     , CoreOps.oneHot'
-    , CoreOps.pack
-    , CoreOps.pack'
     , placeholder
     , placeholder'
     , CoreOps.range
@@ -142,8 +140,6 @@ module TensorFlow.Ops
     , CoreOps.transpose'
     , truncatedNormal
     , truncatedNormal'
-    , CoreOps.unpack
-    , CoreOps.unpack'
     , CoreOps.variable
     , CoreOps.variable'
     , vector
@@ -152,6 +148,11 @@ module TensorFlow.Ops
     , CoreOps.zerosLike
     , CoreOps.zerosLike'
     , scalarize
+    , globalNorm
+    , clipByGlobalNorm
+    , pack
+    , unpack
+    , squeeze
     ) where
 
 import Data.ByteString (ByteString)
@@ -408,3 +409,18 @@ reducedShape inputShape axes =
            axesMod]                               -- [1, 2]
          [inputShape32,                           -- [2, 3, 5, 7]
            CoreOps.fill axesShape 1]              -- [1, 1]
+
+
+    
+globalNorm :: [Tensor v Float] -> Tensor Build Float
+globalNorm = CoreOps.sqrt . reduceSum . pack 0 . map CoreOps.l2Loss
+
+clipByGlobalNorm :: Tensor v1 Float -> [Tensor v2 Float] -> [Tensor Build Float]
+clipByGlobalNorm clipNorm xs =
+    map (CoreOps.mul scale) xs
+  where
+    scale = CoreOps.minimum (clipNorm `CoreOps.div` globalNorm xs) 1
+    
+pack axis = CoreOps.pack' (opAttr "axis" .~ (axis :: Int64))
+unpack axis = CoreOps.unpack' (opAttr "axis" .~ (axis :: Int64))
+squeeze xs = CoreOps.squeeze' (opAttr "squeeze_dims" .~ (xs :: [Int64]))
