@@ -83,24 +83,28 @@ createModel maxSeqLen vocabSize inferLength = do
     inputs <- TF.placeholder' (TF.opName .~ "inputs") (TF.Shape [batchSize, maxSeqLen])
     mask <- TF.placeholder (TF.Shape [batchSize, maxSeqLen])
 
-    let hiddenSize = 512
-    (rnn, zeroStateLike, rnnParams) <- TF.lstm vocabSize hiddenSize
+    let hiddenSize = 256
+    -- (rnn, zeroStateLike, rnnParams) <- TF.lstm vocabSize hiddenSize
+    rnn <-
+        TF.lstm vocabSize hiddenSize
+        `TF.rnnCompose` TF.lstm hiddenSize hiddenSize
+        `TF.rnnCompose` TF.lstm hiddenSize hiddenSize
     logitWeights <- TF.initializedVariable =<< TF.xavierInitializer (TF.Shape [hiddenSize, vocabSize])
     logitBiases <- TF.zeroInitializedVariable (TF.Shape [vocabSize])
-    let allParams = rnnParams ++ [logitWeights, logitBiases]
+    let allParams = TF.rnnParams rnn ++ [logitWeights, logitBiases]
 
     let sequences :: [TF.Tensor TF.Build Float]
         sequences = TF.unpack 1 maxSeqLen (TF.oneHot inputs (fromIntegral vocabSize) 1 0)
-    (_, rnnOutputs) <- mapAccumLM rnn (zeroStateLike (head sequences)) sequences
+    (_, rnnOutputs) <- mapAccumLM (TF.rnnStep rnn) (TF.rnnInitState rnn (head sequences)) sequences
     let logits' = map (\x -> x `TF.matMul` TF.readValue logitWeights + TF.readValue logitBiases) rnnOutputs
         logits = TF.pack 1 logits'
 
     let zeroInput = TF.zeros (TF.Shape [1, vocabSize])
-    inferResults <- flip unfoldrM (zeroStateLike zeroInput, zeroInput, 0) $ \(s, x, i) ->
+    inferResults <- flip unfoldrM (TF.rnnInitState rnn zeroInput, zeroInput, 0) $ \(s, x, i) ->
         if i == inferLength
             then return Nothing
             else do
-                (s', rnnOutput) <- rnn s x
+                (s', rnnOutput) <- TF.rnnStep rnn s x
                 let logits = rnnOutput `TF.matMul` TF.readValue logitWeights + TF.readValue logitBiases
                 chosenWords <- TF.squeeze [1] <$> TF.multinomial logits 1
                 x' <- TF.render (TF.oneHot chosenWords (fromIntegral vocabSize) 1 0)
@@ -239,7 +243,7 @@ main = TF.runSession $ do
 
     -- Train.
     liftIO $ putStrLn "Starting training..."
-    TF.withEventWriter ("/tmp/seq_tflogs/" <> optionsRunName opts) $ \eventWriter ->
+    TF.withEventWriter ("seq_tflogs/" <> optionsRunName opts) $ \eventWriter ->
       TF.withEventWriter ("seq_tflogs/" <> optionsRunName opts <> "_dev") $ \devEventWriter -> do
         forM_ [0..100000] $ \i -> do
             (seqBatch, labelBatch, maskBatch) <- sampleBatch trainExamples

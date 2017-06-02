@@ -16,8 +16,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module TensorFlow.RNN
-    ( gru
+    ( RNN(..)
+    , gru
     , lstm
+    , rnnCompose
     ) where
 
 import Control.Arrow ((&&&))
@@ -29,17 +31,15 @@ import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializ
 import qualified TensorFlow.Variable as TF
 import qualified TensorFlow.GenOps.Core as TF (tanh, sigmoid)
 
-type RNN state =
-    state -> TF.Tensor TF.Build Float -> TF.Build (state, TF.Tensor TF.Build Float)
+data RNN state = RNN
+    { rnnStep :: state -> TF.Tensor TF.Build Float -> TF.Build (state, TF.Tensor TF.Build Float)
+    , rnnInitState :: forall v. TF.Tensor v Float -> state
+    , rnnParams :: [TF.Variable Float]
+    }
 
 type GRUState = TF.Tensor TF.Build Float
 
-gru ::
-    TF.TensorType a =>
-    Int64 -> Int64 -> TF.Build ( RNN GRUState
-                               , TF.Tensor v a -> GRUState
-                               , [TF.Variable Float]
-                               )
+gru :: Int64 -> Int64 -> TF.Build (RNN GRUState)
 gru inputSize outputSize = do
     -- TODO: Create 3 large matrices instead of 9 small ones.
     wz <- TF.initializedVariable =<< TF.xavierInitializer (TF.Shape [inputSize, outputSize])
@@ -59,16 +59,11 @@ gru inputSize outputSize = do
             h <- TF.render $
                 z * hPrev + (1 - z) * TF.tanh (x `TF.matMul` TF.readValue wh + (r * hPrev) `TF.matMul` TF.readValue uh + TF.readValue bh)
             return (TF.expr h, TF.expr h)
-    return (step, zeroStateLike', [wz, wr, wh, uz, ur, uh, bz, br, bh])
+    return (RNN step zeroStateLike' [wz, wr, wh, uz, ur, uh, bz, br, bh])
 
 type LSTMState = (TF.Tensor TF.Build Float, TF.Tensor TF.Build Float)
 
-lstm ::
-    TF.TensorType a =>
-    Int64 -> Int64 -> TF.Build ( RNN LSTMState
-                               , TF.Tensor v a -> LSTMState
-                               , [TF.Variable Float]
-                               )
+lstm :: Int64 -> Int64 -> TF.Build (RNN LSTMState)
 lstm inputSize outputSize = TF.withNameScope "lstm" $ do
     wf <- TF.initializedVariable =<< TF.xavierInitializer (TF.Shape [inputSize, outputSize])
     wi <- TF.initializedVariable =<< TF.xavierInitializer (TF.Shape [inputSize, outputSize])
@@ -92,7 +87,19 @@ lstm inputSize outputSize = TF.withNameScope "lstm" $ do
                 f * cPrev + i * TF.tanh (x `TF.matMul` TF.readValue wc + hPrev `TF.matMul` TF.readValue uc + TF.readValue bc)
             h <- TF.render $ o * TF.tanh c
             return ((TF.expr c, TF.expr h), TF.expr h)
-    return (step, zeroStateLike', [wf, wi, wo, wc, uf, ui, uo, uc, bf, bi, bo, bc])
+    return (RNN step zeroStateLike' [wf, wi, wo, wc, uf, ui, uo, uc, bf, bi, bo, bc])
+
+rnnCompose :: TF.Build (RNN s) -> TF.Build (RNN s') -> TF.Build (RNN (s, s'))
+rnnCompose brnn1 brnn2 = do
+    rnn1 <- brnn1
+    rnn2 <- brnn2
+    let step (prev1, prev2) x = do
+            (next1, out1) <- rnnStep rnn1 prev1 x
+            (next2, out2) <- rnnStep rnn2 prev2 out1
+            return ((next1, next2), out2)
+    return (RNN step
+                (rnnInitState rnn1 &&& rnnInitState rnn2)
+                (rnnParams rnn1 ++ rnnParams rnn2))
 
 
 zeroStateLike ::
