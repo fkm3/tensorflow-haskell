@@ -15,6 +15,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedLists #-}
 
+import Control.Category ((>>>))
 import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Int (Int32, Int64)
@@ -26,6 +27,7 @@ import qualified TensorFlow.Core as TF
 import qualified TensorFlow.Ops as TF hiding (initializedVariable, zeroInitializedVariable)
 import qualified TensorFlow.Variable as TF
 import qualified TensorFlow.Minimize as TF
+import qualified TensorFlow.Layer as Layer
 
 import TensorFlow.Examples.MNIST.InputData
 import TensorFlow.Examples.MNIST.Parse
@@ -64,20 +66,31 @@ createModel = do
     let batchSize = -1
     -- Inputs.
     images <- TF.placeholder [batchSize, numPixels]
-    -- Hidden layer.
-    let numUnits = 500
-    hiddenWeights <-
-        TF.initializedVariable =<< randomParam numPixels [numPixels, numUnits]
-    hiddenBiases <- TF.zeroInitializedVariable [numUnits]
-    let hiddenZ = (images `TF.matMul` TF.readValue hiddenWeights)
-                  `TF.add` TF.readValue hiddenBiases
-    let hidden = TF.relu hiddenZ
-    -- Logits.
-    logitWeights <-
-        TF.initializedVariable =<< randomParam numUnits [numUnits, numLabels]
-    logitBiases <- TF.zeroInitializedVariable [numLabels]
-    let logits = (hidden `TF.matMul` TF.readValue logitWeights)
-                 `TF.add` TF.readValue logitBiases
+
+    (params, _, nn) <- Layer.runLayer [batchSize, 1, 28, 28] $
+        Layer.conv2d 5 2 32 TF.relu
+        >>> Layer.conv2d 5 2 64 TF.relu
+        >>> Layer.flatten
+        >>> Layer.dense 1024 TF.relu
+        >>> Layer.dense numLabels id
+    logits <- TF.render (nn (TF.reshape images (TF.vector [-1 :: Int32, 1, 28, 28])))
+
+    -- -- Hidden layer.
+    -- let numUnits = 500
+    -- hiddenWeights <-
+    --     TF.initializedVariable =<< randomParam numPixels [numPixels, numUnits]
+    -- hiddenBiases <- TF.zeroInitializedVariable [numUnits]
+    -- let hiddenZ = (images `TF.matMul` TF.readValue hiddenWeights)
+    --               `TF.add` TF.readValue hiddenBiases
+    -- let hidden = TF.relu hiddenZ
+    -- -- Logits.
+    -- logitWeights <-
+    --     TF.initializedVariable =<< randomParam numUnits [numUnits, numLabels]
+    -- logitBiases <- TF.zeroInitializedVariable [numLabels]
+    -- let logits = (hidden `TF.matMul` TF.readValue logitWeights)
+    --              `TF.add` TF.readValue logitBiases
+    --     params = [hiddenWeights, hiddenBiases, logitWeights, logitBiases]
+
     predict <- TF.render $ TF.cast $
                TF.argMax (TF.softmax logits) (TF.scalar (1 :: LabelType))
 
@@ -86,7 +99,6 @@ createModel = do
     let labelVecs = TF.oneHot labels (fromIntegral numLabels) 1 0
         loss =
             reduceMean $ fst $ TF.softmaxCrossEntropyWithLogits logits labelVecs
-        params = [hiddenWeights, hiddenBiases, logitWeights, logitBiases]
     trainStep <- TF.minimizeWith TF.adam loss params
 
     let correctPredictions = TF.equal predict labels
@@ -140,10 +152,10 @@ main = TF.runSession $ do
                                (encodeLabelBatch testLabels)
     liftIO $ putStrLn $ "test error " ++ show (testErr * 100)
 
-    -- Show some predictions.
-    testPreds <- infer model (encodeImageBatch testImages)
-    liftIO $ forM_ ([0..3] :: [Int]) $ \i -> do
-        putStrLn ""
-        T.putStrLn $ drawMNIST $ testImages !! i
-        putStrLn $ "expected " ++ show (testLabels !! i)
-        putStrLn $ "     got " ++ show (testPreds V.! i)
+    -- -- Show some predictions.
+    -- testPreds <- infer model (encodeImageBatch testImages)
+    -- liftIO $ forM_ ([0..3] :: [Int]) $ \i -> do
+    --     putStrLn ""
+    --     T.putStrLn $ drawMNIST $ testImages !! i
+    --     putStrLn $ "expected " ++ show (testLabels !! i)
+    --     putStrLn $ "     got " ++ show (testPreds V.! i)

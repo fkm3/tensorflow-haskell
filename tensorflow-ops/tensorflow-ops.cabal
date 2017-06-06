@@ -23,6 +23,7 @@ library
                  , TensorFlow.Queue
                  , TensorFlow.RNN
                  , TensorFlow.Variable
+                 , TensorFlow.Layer
   build-depends:  proto-lens == 0.2.*
                 , base >= 4.7 && < 5
                 , bytestring
