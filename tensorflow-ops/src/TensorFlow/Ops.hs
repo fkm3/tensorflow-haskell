@@ -153,6 +153,7 @@ module TensorFlow.Ops
     , pack
     , unpack
     , squeeze
+    , dropout
     ) where
 
 import Data.ByteString (ByteString)
@@ -421,6 +422,19 @@ clipByGlobalNorm clipNorm xs =
   where
     scale = CoreOps.minimum (clipNorm `CoreOps.div` globalNorm xs) 1
     
+pack :: TensorType t => Int64 -> [Tensor v t] -> Tensor Build t
 pack axis = CoreOps.pack' (opAttr "axis" .~ (axis :: Int64))
+
+unpack :: TensorType t => Int64 -> Int64 -> Tensor v t -> [Tensor Build t]
 unpack axis = CoreOps.unpack' (opAttr "axis" .~ (axis :: Int64))
+
+squeeze :: TensorType t => [Int64] -> Tensor v t -> Tensor Build t
 squeeze xs = CoreOps.squeeze' (opAttr "squeeze_dims" .~ (xs :: [Int64]))
+
+dropout ::
+    (MonadBuild m, OneOf '[ Float, Double ] t)
+    => Tensor v1 t -> Tensor v2 t -> m (Tensor Value t)
+dropout keepProb x = do
+    rand <- CoreOps.randomUniform (shape x)
+    let keepMask = CoreOps.floor (keepProb `CoreOps.add` rand)
+    render ((x `CoreOps.div` keepProb) `CoreOps.mul` keepMask)
