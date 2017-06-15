@@ -41,7 +41,7 @@ testMultipleOutputs = testCase "testMultipleOutputs" $
 testVarargs :: Test
 testVarargs = testCase "testVarargs" $
     runSession $ do
-        xs <- run $ pack $ map scalar [1..8]
+        xs <- run $ pack 0 $ map scalar [1..8]
         liftIO $ [1..8] @=? V.toList (xs :: V.Vector Float)
 
 main :: IO ()

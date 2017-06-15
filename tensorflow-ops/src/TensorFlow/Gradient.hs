@@ -483,6 +483,12 @@ opGrad "Max" _ [toT -> x, toT -> indices] [dz] =
 -- Min and Max have identical gradient implementations.
 opGrad "Min" u v w = opGrad "Max" u v w
 
+opGrad "Maximum" _ [toT -> x, toT -> y] [dz] =
+    minimumMaximumGrad (x :: Tensor Build a) (y :: Tensor Build a) dz CoreOps.greaterEqual
+
+opGrad "Minimum" _ [toT -> x, toT -> y] [dz] =
+    minimumMaximumGrad (x :: Tensor Build a) (y :: Tensor Build a) dz CoreOps.lessEqual
+
 opGrad "Sum" _ [toT -> x, toT -> indices] [dz] =
     [ Just $ CoreOps.tile grad tileScaling, Nothing ]
   where
@@ -610,14 +616,15 @@ opGrad "OneHot" _ _ _ = [Nothing, Nothing, Nothing, Nothing]
 opGrad "TruncatedNormal" _ _ _ = [Nothing]
 
 opGrad "RefIdentity" _ _ [dz] = [Just $ expr dz]
-opGrad "Cast" nodeDef _ [dz] = [Just reverseCast]
-  where
-    -- TODO(gnezdo): too permissive, python only allows float types as src_type.
-    reverseCast =
-        pureOp [] $ pure (opDef "Cast"
-                 & opAttr "DstT" .~ (lookupAttr nodeDef "SrcT" :: ByteString)
-                 & opAttr "SrcT" .~ (lookupAttr nodeDef "DstT" :: ByteString)
-                 & opInputs .~ [renderedOutput dz])
+opGrad "Cast" nodeDef _ [dz] = [Nothing]
+-- opGrad "Cast" nodeDef _ [dz] = [Just reverseCast]
+--   where
+--     -- TODO(gnezdo): too permissive, python only allows float types as src_type.
+--     reverseCast =
+--         pureOp [] $ pure (opDef "Cast"
+--                  & opAttr "DstT" .~ (lookupAttr nodeDef "SrcT" :: ByteString)
+--                  & opAttr "SrcT" .~ (lookupAttr nodeDef "DstT" :: ByteString)
+--                  & opInputs .~ [renderedOutput dz])
 
 opGrad "DynamicStitch" nodeDef inputs [dz] =
     replicate halfLen Nothing ++ valuesGrads
@@ -652,11 +659,24 @@ opGrad "Select" _ [toT -> c, toT -> x, _] [dz] =
     ]
   where zeros = CoreOps.zerosLike x
 
+opGrad "Sigmoid" nodeDef _ [dz] =
+    [Just $ CoreOps.sigmoidGrad output dz]
+  where
+    output :: Tensor Build a
+    output = toT $ Output 0 (NodeName (nodeDef ^. name))
+
+opGrad "Tanh" nodeDef _ [dz] =
+    [Just $ CoreOps.tanhGrad output dz]
+  where
+    output :: Tensor Build a
+    output = toT $ Output 0 (NodeName (nodeDef ^. name))
+
 -- TODO(gnezdo): Unlike Python, no control dependency on dz.
 opGrad "Log" _ [toT -> x] [dz] = [ Just $ dz `CoreOps.mul` CoreOps.inv x ]
--- TODO(gnezdo): Reuse the output instead of doing another exp,
--- though, it is probably CSE'd away anyway.
-opGrad "Exp" _ [toT -> x] [dz] = [ Just $ dz `CoreOps.mul` CoreOps.exp x ]
+opGrad "Exp" nodeDef [toT -> x] [dz] = [ Just $ dz `CoreOps.mul` output ]
+  where
+    output :: Tensor Build a
+    output = toT $ Output 0 (NodeName (nodeDef ^. name))
 opGrad "SparseSegmentSum" _ [toT -> x, toT -> y, toT -> t] [dz] =
     [ Just $ CoreOps.unsortedSegmentSum
              (CoreOps.gather dz (t :: Tensor Build Int32))
@@ -665,6 +685,14 @@ opGrad "SparseSegmentSum" _ [toT -> x, toT -> y, toT -> t] [dz] =
     , Nothing
     ]
   where inputRows = flatSlice (shape (x :: Tensor Build a)) 0 1
+
+
+opGrad "Pack" nodeDef _ [dz] =
+    Just <$> CoreOps.unpack' (opAttr "axis" .~ (lookupAttr nodeDef "axis" :: Int64))
+                             (lookupAttr nodeDef "N") dz
+
+opGrad "Unpack" nodeDef _ dzs =
+    [Just $ CoreOps.pack' (opAttr "axis" .~ (lookupAttr nodeDef "axis" :: Int64)) dzs]
 
 opGrad "LabelClasses" _ _ _ = [Nothing, Nothing]
 opGrad "LabelWeights" _ _ _ = [Nothing]
@@ -685,6 +713,7 @@ opGrad "Tile" _ [toT -> x, toT -> multiples] [dz] =
     reshapedDz = CoreOps.reshape dz splitShape
 
 opGrad "ZerosLike" _ _ _ = [Nothing]
+opGrad "Floor" _ _ _ = [Nothing]
 opGrad "Fill" _ _ [dz] = [Nothing, Just $ sum dz rx]
   where
     rx = rangeOfRank dz
@@ -705,6 +734,27 @@ opGrad n nodeDef ins grads =
     error $ "no gradient implemented for " ++
             show (n, length ins, length grads, showMessage nodeDef, ins)
 
+minimumMaximumGrad :: forall a. GradientCompatible a
+    => Tensor Build a
+    -> Tensor Build a
+    -> Tensor Value a
+    -> (Tensor Build a -> Tensor Build a -> Tensor Build Bool)
+    -> [Maybe (Tensor Build a)]
+minimumMaximumGrad x y dz selectorOp =
+    [Just gx, Just gy]
+  where
+    sx = shape x
+    sy = shape y
+    sd = shape dz
+    zeros = CoreOps.fill sd 0 :: Tensor Build a
+    xmask = selectorOp x y
+    ymask = CoreOps.logicalNot xmask
+    (rx, ry) = broadcastGradientArgs sx sy
+    xgrad = CoreOps.select xmask dz zeros
+    ygrad = CoreOps.select ymask dz zeros
+    gx = reshape (sum xgrad rx) sx
+    gy = reshape (sum ygrad ry) sy
+
 -- | The number of outputs for an op type.
 numOutputs :: NodeDef -> OutputIx
 numOutputs o =
@@ -721,13 +771,17 @@ numOutputs o =
         "Exp" -> 1
         "Gather" -> 1
         "LabelClasses" -> 1
+        "Fill" -> 1
+        "Floor" -> 1
         "LabelWeights" -> 1
         "Log" -> 1
         "MatMul" -> 1
         "Max" -> 1
         "MaxPool" -> 1
+        "Maximum" -> 1
         "Mean" -> 1
         "Min" -> 1
+        "Minimum" -> 1
         "Mul" -> 1
         "Neg" -> 1
         "Placeholder" -> 1
@@ -750,7 +804,10 @@ numOutputs o =
         "VarHandleOp" -> 1
         "Variable" -> 1
         "ZerosLike" -> 1
-        "Fill" -> 1
+        "Pack" -> 1
+        "Unpack" -> fromIntegral (lookupAttr o "N" :: Int64)
+        "Tanh" -> 1
+        "Sigmoid" -> 1
         _ -> error $ "numOuputs not implemented for " ++ show (o ^. op)
 
 -- Divides `x / y` assuming `x, y >= 0`, treating `0 / 0 = 0`

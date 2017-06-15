@@ -75,6 +75,7 @@ module TensorFlow.Ops
     , CoreOps.concat'
     , constant
     , constant'
+    , dropout
     , CoreOps.equal
     , CoreOps.equal'
     , expandDims
@@ -99,8 +100,6 @@ module TensorFlow.Ops
     , CoreOps.neg'
     , CoreOps.oneHot
     , CoreOps.oneHot'
-    , CoreOps.pack
-    , CoreOps.pack'
     , placeholder
     , placeholder'
     , CoreOps.range
@@ -119,6 +118,7 @@ module TensorFlow.Ops
     , scalar'
     , shape
     , shape'
+    , slice
     , CoreOps.sign
     , CoreOps.sign'
     , CoreOps.size
@@ -133,6 +133,8 @@ module TensorFlow.Ops
     , CoreOps.sub'
     , CoreOps.sum
     , CoreOps.sum'
+    , reduceMean
+    , reduceMean'
     , reduceSum
     , reduceSum'
     , CoreOps.transpose
@@ -147,6 +149,11 @@ module TensorFlow.Ops
     , CoreOps.zerosLike
     , CoreOps.zerosLike'
     , scalarize
+    , globalNorm
+    , clipByGlobalNorm
+    , pack
+    , unpack
+    , squeeze
     ) where
 
 import Data.ByteString (ByteString)
@@ -316,19 +323,34 @@ scalarize t = CoreOps.reshape t (vector scalarShape)
     where
         scalarShape = [] :: [Int32]
 
+allAxes :: TensorType a => Tensor v a -> Tensor Build Int32
+allAxes x = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+
 -- | Sum a tensor down to a scalar
--- Seee `TensorFlow.GenOps.Core.sum`
+--
+-- See `TensorFlow.GenOps.Core.sum`
 reduceSum :: (OneOf '[ Double, Float, Int32, Int64
                      , Complex Float, Complex Double] a) =>
              Tensor v a -> Tensor Build a
-reduceSum x = CoreOps.sum x allAxes
-  where allAxes = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+reduceSum x = CoreOps.sum x (allAxes x)
 
 reduceSum' :: (OneOf '[ Double, Float, Int32, Int64
                       , Complex Float, Complex Double] a) =>
               OpParams -> Tensor v a -> Tensor Build a
-reduceSum' params x = CoreOps.sum' params x allAxes
-  where allAxes = CoreOps.range 0 (CoreOps.rank x :: Tensor Build Int32) 1
+reduceSum' params x = CoreOps.sum' params x (allAxes x)
+
+-- | Mean of all elements of a tensor.
+--
+-- See `TensorFlow.GenOps.Core.mean`
+reduceMean :: (OneOf '[ Double, Float, Int32, Int64
+                     , Complex Float, Complex Double] a) =>
+             Tensor v a -> Tensor Build a
+reduceMean x = CoreOps.mean x (allAxes x)
+
+reduceMean' :: (OneOf '[ Double, Float, Int32, Int64
+                      , Complex Float, Complex Double] a) =>
+              OpParams -> Tensor v a -> Tensor Build a
+reduceMean' params x = CoreOps.mean' params x (allAxes x)
 
 -- | Create a constant vector.
 vector :: TensorType a => [a] -> Tensor Build a
@@ -372,6 +394,10 @@ expandDims = CoreOps.expandDims
 expandDims' :: TensorType t => OpParams -> Tensor v1 t -> Tensor v2 Int32 -> Tensor Build t
 expandDims' = CoreOps.expandDims'
 
+-- | More heavily type constrained version of `CoreOps.slice`.
+slice :: TensorType t => Tensor v1 t -> Tensor v2 Int32 -> Tensor v3 Int32 -> Tensor Build t
+slice = CoreOps.slice
+
 -- | Helper function for reduction ops (translation of math_ops.reduced_shape).
 reducedShape :: (OneOf '[ Int32, Int64 ] t1, OneOf '[ Int32, Int64 ] t2) =>
                 Tensor v1 t1 -> Tensor v2 t2 -> Tensor Build Int32
@@ -387,3 +413,53 @@ reducedShape inputShape axes =
            axesMod]                               -- [1, 2]
          [inputShape32,                           -- [2, 3, 5, 7]
            CoreOps.fill axesShape 1]              -- [1, 1]
+
+-- | Compute the global norm of multiple tensors.
+globalNorm :: [Tensor v Float] -> Tensor Build Float
+globalNorm =
+    CoreOps.sqrt . (CoreOps.mul 2) . reduceSum . pack 0 . map CoreOps.l2Loss
+
+-- | Clip values of multiple tensors by the ratio of the sum of their norms.
+clipByGlobalNorm :: Tensor v1 Float -> [Tensor v2 Float] -> [Tensor Build Float]
+clipByGlobalNorm clipNorm xs =
+    map (CoreOps.mul scale) xs
+  where
+    scale = CoreOps.minimum (clipNorm `CoreOps.div` globalNorm xs) 1
+
+-- | Convenient version of `CoreOps.pack`.
+pack :: TensorType t => Int64 -> [Tensor v t] -> Tensor Build t
+pack axis = CoreOps.pack' (opAttr "axis" .~ (axis :: Int64))
+
+-- | Convenient version of `CoreOps.unpack`.
+unpack :: TensorType t => Int64 -> Int64 -> Tensor v t -> [Tensor Build t]
+unpack axis = CoreOps.unpack' (opAttr "axis" .~ (axis :: Int64))
+
+-- | Convenient version of `CoreOps.squeeze`.
+squeeze :: TensorType t => [Int64] -> Tensor v t -> Tensor Build t
+squeeze xs = CoreOps.squeeze' (opAttr "squeeze_dims" .~ (xs :: [Int64]))
+
+-- | Computes dropout.
+--
+-- With probability `keepProb`, outputs the input element scaled up by
+-- `1 / keepProb`, otherwise outputs `0`. The scaling is so that the
+-- expected sum is unchanged.
+dropout ::
+    (MonadBuild m, OneOf '[ Float, Double ] t)
+    => Tensor v1 t -> Tensor v2 t -> m (Tensor Value t)
+dropout keepProb x = do
+    rand <- CoreOps.randomUniform (shape x)
+    let keepMask = CoreOps.floor (keepProb `CoreOps.add` rand)
+    render ((x `CoreOps.div` keepProb) `CoreOps.mul` keepMask)
+
+-- | Huber loss.
+--
+-- See https://en.wikipedia.org/wiki/Huber_loss.
+huberLoss ::
+    (Fractional t, TensorType t, OneOf '[ Float, Double ] t)
+    => Tensor v1 t -> Tensor v2 t -> Tensor Build t
+huberLoss delta x =
+    CoreOps.select
+        (CoreOps.abs x `CoreOps.less` delta)
+        (scalar 0.5 `CoreOps.mul` CoreOps.square x)
+        (delta `CoreOps.mul`
+         (CoreOps.abs x `CoreOps.sub` (scalar 0.5 `CoreOps.mul` delta)))
